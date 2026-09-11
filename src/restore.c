@@ -47,6 +47,7 @@
 #include "idevicerestore.h"
 #include "asr.h"
 #include "fdr.h"
+#include "t1.h"
 #include "fls.h"
 #include "mbn.h"
 #include "ftab.h"
@@ -1195,6 +1196,8 @@ int restore_send_root_ticket(struct idevicerestore_client_t* client, plist_t mes
 		}
 		free(data);
 	}
+
+	t1_augment_root_ticket(dict);
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
@@ -2429,6 +2432,7 @@ int restore_send_fdr_trust_data(struct idevicerestore_client_t* client, plist_t 
 	/* Sending an empty dict makes it continue with FDR
 	 * and this is what iTunes seems to be doing too */
 	dict = plist_new_dict();
+	t1_augment_fdr_trust_data(dict, message);
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
@@ -4916,6 +4920,39 @@ logger(LL_DEBUG, "%s: type = %s\n", __func__, type);
 			}
 		}
 
+		else if (!strcmp(type, "FDRMemoryCommit")) {
+			int t1r = t1_handle_fdr_memory_commit(client, message);
+			if (t1r < 0) {
+				logger(LL_ERROR, "Unable to handle FDRMemoryCommit\n");
+				return -1;
+			}
+			if (t1r > 0) {
+				logger(LL_ERROR, "FDRMemoryCommit received but T1 FDR output is not armed\n");
+				return -1;
+			}
+			/* The device blocks until the host acknowledges the commit. Without
+			 * this reply restored waits forever ("Successfully committed
+			 * memoryStore to host." is logged only after the ack). */
+			{
+				restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
+				plist_t ack;
+				restored_error_t re;
+				if (!service) {
+					logger(LL_ERROR, "%s: Unable to connect to service client for FDRMemoryCommit ack\n", __func__);
+					return -1;
+				}
+				ack = plist_new_dict();
+				re = _restore_service_send(service, ack, 0);
+				plist_free(ack);
+				_restore_service_free(service);
+				if (re != RESTORE_E_SUCCESS) {
+					logger(LL_ERROR, "Unable to acknowledge FDRMemoryCommit (%d)\n", re);
+					return -1;
+				}
+				logger(LL_INFO, "T1: FDRMemoryCommit acknowledged\n");
+			}
+		}
+
 		else if (!strcmp(type, "FDRTrustData")) {
 			if(restore_send_fdr_trust_data(client, message) < 0) {
 				logger(LL_ERROR, "Unable to send FDR Trust data\n");
@@ -5231,6 +5268,7 @@ plist_t restore_supported_data_types()
 	plist_dict_set_item(dict, "USBCFWData", plist_new_bool(0));
 	plist_dict_set_item(dict, "USBCOverride", plist_new_bool(0));
 	plist_dict_set_item(dict, "UpdateVolumeOverlayRootDataCount", plist_new_bool(1));
+	t1_apply_supported_data_types(dict);
 	return dict;
 }
 
@@ -5608,7 +5646,41 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
 	}
 	plist_dict_set_item(opts, "SystemPartitionPadding", spp);
 
+	/* T1: must run after every upstream opts write, since the EmbeddedOS
+	 * restore has to override CreateFilesystemPartitions/SystemImage. */
+	t1_apply_restore_options(opts);
+
 	// start the restore process
+	/* T1: log exactly which option keys go to the device (keys only, no values). */
+	if (t1_embeddedos_enabled()) {
+		plist_dict_iter it = NULL; char *k = NULL; plist_t v = NULL;
+		logger(LL_INFO, "T1: StartRestore options sent to device (%u keys):\n", plist_dict_get_size(opts));
+		plist_dict_new_iter(opts, &it);
+		if (it) {
+			do {
+				plist_dict_next_item(opts, it, &k, &v);
+				if (!k) break;
+				if (plist_get_node_type(v) == PLIST_BOOLEAN) {
+					uint8_t b = 0; plist_get_bool_val(v, &b);
+					logger(LL_INFO, "T1:   %s = %s\n", k, b ? "true" : "false");
+				} else if (plist_get_node_type(v) == PLIST_DICT) {
+					logger(LL_INFO, "T1:   %s = <dict, %u keys>\n", k, plist_dict_get_size(v));
+				} else {
+					logger(LL_INFO, "T1:   %s = <%s>\n", k,
+					       plist_get_node_type(v) == PLIST_STRING ? "string" :
+					       plist_get_node_type(v) == PLIST_INT ? "int" : "other");
+				}
+				free(k); k = NULL;
+			} while (1);
+			free(it);
+		}
+		plist_t sdt = plist_dict_get_item(opts, "SupportedDataTypes");
+		if (sdt) {
+			uint8_t b = 0; plist_t n = plist_dict_get_item(sdt, "FDRMemoryCommit");
+			if (n) plist_get_bool_val(n, &b);
+			logger(LL_INFO, "T1:   SupportedDataTypes.FDRMemoryCommit = %s\n", n ? (b ? "true" : "false") : "(absent)");
+		}
+	}
 	restore_error = restored_start_restore(restore, opts, client->restore->protocol_version);
 	if (restore_error != RESTORE_E_SUCCESS) {
 		logger(LL_ERROR, "Unable to start the restore process\n");

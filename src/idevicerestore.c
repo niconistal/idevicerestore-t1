@@ -51,6 +51,7 @@
 #include "common.h"
 #include "normal.h"
 #include "restore.h"
+#include "t1.h"
 #include "download.h"
 #include "recovery.h"
 #include "idevicerestore.h"
@@ -373,6 +374,13 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			idevice_set_debug_level(1);
 		}
 		tss_set_debug_level(client->debug_level);
+	}
+
+	/* T1 phase 14: replay a previously captured memboot image + AP ticket
+	 * against a T1 in recovery. Does not run a restore at all. */
+	if (t1_phase14_enabled()) {
+		logger(LL_INFO, "T1: phase 14 mode - no restore will be performed\n");
+		return t1_phase14(client);
 	}
 
 	progress_reset_tag();
@@ -857,9 +865,19 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	idevicerestore_progress(client, RESTORE_STEP_DETECT, 0.8);
 
 	/* check if device type is supported by the given build manifest */
-	if (build_manifest_check_compatibility(client->build_manifest, client->device->product_type) < 0) {
-		logger(LL_ERROR, "Could not make sure this firmware is suitable for the current device. Refusing to continue.\n");
-		return -1;
+	{
+		int t1_compat = t1_manifest_matches_device(client->build_manifest,
+		                                           client->device->chip_id,
+		                                           client->device->board_id);
+		if (t1_compat == 0) {
+			logger(LL_ERROR, "Could not make sure this firmware is suitable for the current device. Refusing to continue.\n");
+			return -1;
+		}
+		if (t1_compat < 0 &&
+		    build_manifest_check_compatibility(client->build_manifest, client->device->product_type) < 0) {
+			logger(LL_ERROR, "Could not make sure this firmware is suitable for the current device. Refusing to continue.\n");
+			return -1;
+		}
 	}
 
 	/* print iOS information from the manifest */
@@ -1117,16 +1135,24 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 	logger(LL_INFO, "All required components found in IPSW\n");
 
-	/* Get OS (filesystem) name from build identity */
+	/* Get OS (filesystem) name from build identity.
+	 * An EmbeddedOS firmware restore installs no root filesystem at all - the
+	 * bundle carries OSRamdisk instead of an OS component - so there is nothing
+	 * to look up or extract, and client->filesystem stays NULL. It is only
+	 * consumed when restored asks for SystemImageData, which cannot happen with
+	 * SystemImage=false. */
 	char* os_path = NULL;
-	if (build_identity_get_component_path(build_identity, "OS", &os_path) < 0) {
+	int t1_no_fs = t1_embeddedos_enabled();
+	if (t1_no_fs) {
+		logger(LL_INFO, "T1: EmbeddedOS restore carries no filesystem image; skipping OS component\n");
+	} else if (build_identity_get_component_path(build_identity, "OS", &os_path) < 0) {
 		logger(LL_ERROR, "Unable to get path for filesystem component\n");
 		return -1;
 	}
 
 	/* check if IPSW has OS component 'stored' in ZIP archive, otherwise we need to extract it */
 	int needs_os_extraction = 0;
-	if (client->ipsw->zip) {
+	if (!t1_no_fs && client->ipsw->zip) {
 		ipsw_file_handle_t zfile = ipsw_file_open(client->ipsw, os_path);
 		if (zfile) {
 			if (!zfile->seekable) {
@@ -1136,7 +1162,7 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		}
 	}
 
-	if (needs_os_extraction && !(client->flags & FLAG_SHSHONLY)) {
+	if (!t1_no_fs && needs_os_extraction && !(client->flags & FLAG_SHSHONLY)) {
 		char* tmpf = NULL;
 		struct stat st;
 		if (client->cache_dir) {
@@ -1546,6 +1572,15 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 			return 0;
 		}
 		client->ignore_device_add_events = 1;
+
+		/* T1: capture the personalized image and the AP ticket from the SAME
+		 * TSS transaction that is about to be used for phase 11. Phase 14
+		 * replays exactly this pair; a later ticket will be rejected. */
+		if (t1_save_preflight(client, build_identity, client->tss) < 0) {
+			logger(LL_ERROR, "T1: preflight capture failed; not starting restore\n");
+			return -1;
+		}
+
 		logger(LL_INFO, "About to restore device... \n");
 		result = restore_device(client, build_identity);
 		if (result < 0) {

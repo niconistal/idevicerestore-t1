@@ -42,6 +42,7 @@ idevicerestore_SOURCES = \
 	dfu.c dfu.h \
 	recovery.c recovery.h \
 	restore.c restore.h \
+	t1.c t1.h \
 	asr.c asr.h \
 	fdr.c fdr.h \
 	ace3.c ace3.h \
